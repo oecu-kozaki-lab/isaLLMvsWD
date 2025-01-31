@@ -1,0 +1,1169 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>is-a関係生成</title>
+    <style>
+        ul {
+            list-style-type: none;
+        }
+
+        ul li {
+            margin-left: 20px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>is-a関係生成</h1>
+    <form id="inputForm">
+        <label for="word">単語:</label>
+        <input type="text" id="word" name="word" value="家具" required>
+        <label for="depth">深さ:</label>
+        <input type="number" id="depth" name="depth" value="2" required>
+        <label for="width">幅:</label>
+        <input type="number" id="width" name="width" value="2" required>
+        <button type="button" id="btn">生成</button>
+        <br>
+        <label for="word">wikidataで参照したい単語のQID:</label>
+        <input type="text" id="QID" name="QID" value="Q14745" required>
+        <br>
+        <label for="stages">取得する段数を選択してください</label>
+        <select id="stages">
+            <option value="two">2</option>
+            <option value="three">3</option>
+            <option value="four" selected>4</option>
+        </select>
+        段(wikidataが取得できない場合3段を利用してください。)
+    </form>
+
+    <h2>ログ</h2>
+    <textarea id="logTextarea" rows="10" cols="80"></textarea>
+    <br>
+    <button onclick="downloadLogFromTextarea('logTextarea')">TSVファイルをダウンロード</button>
+    <div id="result"></div>
+    ChatGPT
+    <textarea id="test"></textarea>
+    Wikidata
+    <textarea id="test2"></textarea>
+    <div id="tree"></div>
+    <div id="itti"></div>
+    <div id="results"></div>
+    <!-- <div id="resultsTable"></div> -->
+    <!-- <button type="button" id="button1">KGデータダウンロード</button>
+    <button type="button" id="button2">ChatGPTデータダウンロード</button> -->
+
+    <script>
+        function saiki(index, path, obj) {
+            if (index >= path.length - 1) {
+                obj[path[index]] = {};
+                return obj;
+            } else {
+                obj[path[index]] = saiki(index + 1, path, obj[path[index]]);
+                return obj;
+            }
+        }
+
+        // 非同期関数でリクエストを送信
+        async function fetchResults(conversation) {
+            const apiKey = 'XXXXXXXXXXXXXXXXX'; // APIキーを設定【ChatGPTのAPIのKeyを取得してここに入力してください】
+
+            const maxTokens = 1500;
+            const results = [];
+
+            try {
+                const response = await fetch('https://api.openai.com/v1/chat/completions', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${apiKey}`
+                    },
+                    body: JSON.stringify({
+                        model: 'gpt-3.5-turbo',
+                        messages: conversation,
+                        max_tokens: maxTokens,
+                        temperature: 0.7,
+                    })
+                });
+
+                const data = await response.json();
+                if (!data.choices || !Array.isArray(data.choices)) {
+                    throw new Error('API response does not contain choices array.');
+                }
+                if (!data.choices[0].message || !data.choices[0].message.content) {
+                    throw new Error('API response does not contain message content.');
+                }
+
+                const content = data.choices[0].message.content.trim();
+                const gptResult = content.split('\n');
+                results.push(...gptResult);
+
+                conversation.push({ role: "assistant", content: content });
+
+                return results;
+            } catch (error) {
+                const resultDiv = document.getElementById("result");
+                resultDiv.innerHTML = `<p>エラーが発生しました: ${error.message}</p>`;
+                console.error('Error:', error);
+            }
+        }
+
+        function convertTree(resultArray) {
+            let resultsJson = {};
+            let path = [];
+
+            for (const element of resultArray) {
+                const blank = element.match(/\s/g);
+                const blankNum = (blank ? blank.length : 0) / 2 + 1;
+
+                if (path.length < blankNum) {
+                    path.push(element.trim());
+                } else {
+                    path = path.slice(0, blankNum - 1);
+                    path.push(element.trim());
+                }
+                resultsJson = saiki(0, path, resultsJson);
+            }
+            return resultsJson;
+        }
+
+        function displayResults(results) {
+            const results_json = convertTree(results);
+            document.getElementById("test").value = JSON.stringify(results_json, null, 2);
+            const resultDiv = document.getElementById("result");
+            resultDiv.innerHTML = `<h2>結果:</h2>`;
+            createTree(resultDiv, results_json);
+            return results_json;
+        }
+
+        function createTree(container, obj) {
+            container.appendChild(createTreeDom(obj));
+        }
+
+        function createTreeDom(obj) {
+            if (!Object.keys(obj).length) return;
+
+            let ul = document.createElement('ul');
+            for (let key in obj) {
+                let li = document.createElement('li');
+                li.innerHTML = key;
+
+                let childrenUl = createTreeDom(obj[key]);
+                if (childrenUl) {
+                    li.appendChild(childrenUl);
+                }
+                ul.appendChild(li);
+            }
+            return ul;
+        }
+
+
+        // Wikidata内にChatGPTのキーが存在するかを柔軟に確認する再帰関数
+        function flexibleSearchInWikidata(key, node, currentLevel = 0) {
+            if (!node) return { found: false, levels: -1, isAlias: false, matchedAlias: null, node: null };
+
+            // `name`が一致する場合
+            if (node.name === key) {
+                return {
+                    found: true,
+                    levels: currentLevel,
+                    isAlias: false,
+                    matchedAlias: null,
+                    node: node // 親ノード情報を返す
+                };
+            }
+
+            // `aliases`が一致する場合
+            if (node.aliases && node.aliases.includes(key)) {
+                const matchedAlias = node.aliases.find((alias) => alias === key);
+                return {
+                    found: true,
+                    levels: currentLevel,
+                    isAlias: true,
+                    matchedAlias: matchedAlias,
+                    node: node // 親ノード情報を返す
+                };
+            }
+
+            // 子ノードを再帰的に探索
+            if (node.children) {
+                for (const child of node.children) {
+                    const result = flexibleSearchInWikidata(key, child, currentLevel + 1);
+                    if (result.found) {
+                        return result;
+                    }
+                }
+            }
+
+            // 一致しない場合
+            return { found: false, levels: -1, isAlias: false, matchedAlias: null, node: null };
+        }
+
+
+
+        // フォーマット2の中で特定のnameを探す（記号などを無視して検索）
+        function cleanName(name) {
+            // 不要な記号や空白を削除し、小文字化
+            return name.replace(/[・\s]/g, "").toLowerCase();
+        }
+
+        function searchInFormat2(name, format2) {
+            const cleanedName = cleanName(name);
+
+            for (const key in format2) {
+                if (cleanName(key) === cleanedName) {
+                    return true;
+                }
+                // 子階層があれば再帰的に探索
+                if (typeof format2[key] === 'object' && format2[key] !== null) {
+                    if (searchInFormat2(name, format2[key])) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        // 親子関係が途中に存在しない単語が生成されていても、最終的に一致するか確認する関数
+        function deepCompareWithSkipping(format1, format2) {
+            for (const key in format2) {
+                if (searchInFormat2(key, format1)) {
+                    // 一致する場合、その子階層も探索して確認
+                    if (typeof format2[key] === 'object' && format2[key] !== null) {
+                        if (deepCompareWithSkipping(format1, format2[key])) {
+                            return true;
+                        }
+                    }
+                    return true; // 最終的に一致が見つかった場合
+                }
+            }
+            return false; // すべての親子関係を確認したが、一致が見つからなかった場合
+        }
+
+        // Wikidata内でキーを柔軟に探索する関数（間に階層があっても確認）
+        // function flexibleSearchInWikidata(key, wikidata, currentLevel) {
+        //     // nameが一致するか確認
+        //     if (wikidata.name && key === wikidata.name) {
+        //         return { found: true, levels: currentLevel };  // 一致が見つかった場合、階層の段数を返す
+        //     }
+
+
+        //     // 子要素が存在する場合、再帰的に子要素をチェック
+        //     if (wikidata.children && Array.isArray(wikidata.children)) {
+        //         for (let child of wikidata.children) {
+        //             const result = flexibleSearchInWikidata(key, child, currentLevel + 1);
+        //             if (result.found) {
+        //                 return result;  // 一致が見つかればそれを返す
+        //             }
+        //         }
+        //     }
+
+
+        //     return { found: false, levels: currentLevel };  // 一致が見つからなかった場合
+        // }
+
+        // ChatGPTキーがWikidata内でどこかに存在するかを階層検索する関数
+        // function flexibleSearchInWikidata(key, wikidata) {
+        //     let levels = 0;
+        //     let found = false;
+
+        //     function recursiveSearch(node, currentLevel) {
+        //         if (node.name === key || (node.aliases && node.aliases.includes(key))) {
+        //             levels = currentLevel;
+        //             found = true;
+        //             return true;
+        //         }
+        //         if (node.children) {
+        //             for (const child of node.children) {
+        //                 if (recursiveSearch(child, currentLevel + 1)) return true;
+        //             }
+        //         }
+        //         return false;
+        //     }
+
+        //     found = recursiveSearch(wikidata, 0);
+        //     return { found, levels };
+        // }
+
+        // function flexibleSearchInWikidata(key, node, currentLevel = 0) {
+        //     if (!node) return { found: false, levels: -1, isAlias: false };
+
+        //     // 現在のノードの名前またはエイリアスが一致するかを確認
+        //     if (node.name === key) {
+        //         return { found: true, levels: currentLevel, isAlias: false };
+        //     }
+        //     if (node.aliases && node.aliases.includes(key)) {
+        //         return { found: true, levels: currentLevel, isAlias: true };
+        //     }
+
+        //     // 子ノードに対して再帰的に探索（親子関係を柔軟に維持）
+        //     if (node.children) {
+        //         for (const child of node.children) {
+        //             const result = flexibleSearchInWikidata(key, child, currentLevel + 1);
+        //             if (result.found) {
+        //                 return result;  // 一致した結果を返す
+        //             }
+        //         }
+        //     }
+
+        //     return { found: false, levels: -1, isAlias: false };  // 一致が見つからない場合
+        // }
+
+        // ChatGPTの構造とWikidataのツリー構造を比較する関数
+        function compareChatGPTWithFlexibility(chatgpt, wikidata, depth = 0, parentKey = null, isRoot = true) {
+            let matchCount = 0;
+            let totalCount = 0;
+            let results = []; // 各行を格納する配列
+
+            for (const key in chatgpt) {
+                if (chatgpt.hasOwnProperty(key)) {
+                    totalCount++;
+
+                    // 親子関係の表示用
+                    const parentChildRelation = parentKey
+                        ? `「${parentKey}: ${key}」`
+                        : `「${key}」`;
+
+                    let line = ``; // 1行分の内容
+
+                    if (isRoot) {
+                        // ルートノードの場合
+                        line = `「${key}」 は最上位概念です`;
+                    } else {
+                        // 親ノードの確認
+                        const parentNode = parentKey
+                            ? flexibleSearchInWikidata(parentKey, wikidata)
+                            : { found: true, levels: -1, isAlias: false, matchedAlias: null, node: wikidata };
+
+                        if (parentNode.found) {
+                            const searchResult = flexibleSearchInWikidata(key, parentNode.node);
+
+                            if (searchResult.found) {
+                                line = searchResult.isAlias
+                                    ? `△${parentChildRelation}階層: ${searchResult.levels})`
+                                    : `〇${parentChildRelation}階層: ${searchResult.levels}`;
+                                matchCount++;
+                            } else {
+                                line = `✖${parentChildRelation}(is-a関係がありません)`;
+                            }
+                        } else {
+                            line = `✖${parentChildRelation}(親が存在しません)`;
+                        }
+                    }
+
+                    results.push(line + '\n' + '<br><br>'); // 行を配列に追加
+
+                    // 子要素の再帰的チェック
+                    if (typeof chatgpt[key] === "object" && chatgpt[key] !== null && !Array.isArray(chatgpt[key])) {
+                        const childResult = compareChatGPTWithFlexibility(chatgpt[key], wikidata, depth + 1, key, false);
+                        //const childResult = classifyTerms(chatgpt[key], wikidata);
+                        matchCount += childResult.matchCount;
+                        totalCount += childResult.totalCount;
+                        results.push(childResult.resultsHTML.replace(/^"|"$/g, "")); // 子要素の結果を配列に追加（余分なクオート削除）
+                    }
+                }
+            }
+
+            // 最終的な結果を改行で結合し、一括でクオートで囲む
+            const resultsHTML = `"${results.join("")}"`;
+            return { matchCount, totalCount, resultsHTML };
+        }
+
+
+
+        // 名前または別名で一致するかどうかをチェックする関数
+        function isMatchWithAliases(name, wikidataItem) {
+            if (!wikidataItem) return false;  // undefinedやnullを避ける
+
+            if (wikidataItem.name === name) {
+                return true;
+            }
+
+            // 名前が一致しない場合は別名 (alias) をチェック
+            if (wikidataItem.alias && wikidataItem.alias.includes(name)) {
+                return true;
+            }
+
+            return false;
+        }
+
+        // 循環参照を持つオブジェクトをJSONに変換する関数
+        function safeStringify(obj) {
+            const seen = new WeakSet();
+            return JSON.stringify(obj, (key, value) => {
+                if (typeof value === "object" && value !== null) {
+                    if (seen.has(value)) {
+                        return; // 循環参照をスキップ
+                    }
+                    seen.add(value);
+                }
+                return value;
+            }, 2);
+        }
+
+
+        // 結果を評価する関数
+        function evaluateChatGPTWithWikidata(chatgpt, wikidata) {
+            const result = compareChatGPTWithFlexibility(chatgpt, wikidata);
+            let resultsHTML = "";
+            resultsHTML += `一致率: ${result.matchCount} / ${result.totalCount}`;
+            console.log(`一致率: ${result.matchCount} / ${result.totalCount}`);
+
+            if (result.matchCount === result.totalCount) {
+                resultsHTML += `ChatGPTの内容はWikidataと完全に一致しました。`;
+                console.log("ChatGPTの内容はWikidataと完全に一致しました。");
+            } else {
+                resultsHTML += `ChatGPTの内容の一部がWikidataと一致しませんでした。`;
+                console.log("ChatGPTの内容の一部がWikidataと一致しませんでした。");
+            }
+
+            return resultsHTML;
+        }
+
+        // 評価結果をHTMLに表示
+        function displayComparisonResult(chatgpt, wikidata) {
+            const result = compareChatGPTWithFlexibility(chatgpt, wikidata);
+
+            console.log(result.matchCount, result.totalCount, result.resultsHTML);
+            const resultDiv = document.getElementById("itti");
+            resultDiv.innerHTML = `<h2>評価結果:</h2>${result.resultsHTML}<h2>一致率:</h2> ${result.matchCount} / ${result.totalCount - 1}`;
+        }
+
+        // 評価結果をHTMLに表示する部分
+        function displayComparisonResult2(chatgpt, wikidata) {
+            const result = compareChatGPTWithFlexibility(chatgpt, wikidata);
+
+            console.log(result.matchCount, result.totalCount, result.resultsHTML);
+            const resultsHTML = evaluateChatGPTWithWikidata(chatgpt, wikidata);
+
+            const resultDiv = document.getElementById("itti");
+            resultDiv.innerHTML = `<h2>評価結果:</h2>${resultsHTML}<p>一致率: ${result.matchCount} / ${result.totalCount}</p>`;
+        }
+
+
+        // 評価結果をHTMLに表示
+        // function displayComparisonResult2(chatgpt, wikidata) {
+        //     const result = compareChatGPTWithFlexibility(chatgpt, wikidata);
+        //     const resultsHTML = evaluateChatGPTWithWikidata(chatgpt, wikidata);
+        //     const resultDiv = document.getElementById("itti");
+        //     resultDiv.innerHTML = `<h2>評価結果:</h2>${resultsHTML}<p>一致率: ${result.matchCount} / ${result.totalCount}</p>`;
+        // }
+
+
+        async function fetchSPARQLResults(query) {
+            const url = "https://query.wikidata.org/sparql";
+            const headers = { "Accept": "application/sparql-results+json" };
+
+            const params = new URLSearchParams();
+            params.set("query", query);
+
+            try {
+                const response = await fetch(`${url}?${params.toString()}`, { headers });
+                if (!response.ok) {
+                    throw new Error(`SPARQLクエリの取得に失敗しました: ${response.statusText}`);
+                }
+
+                const data = await response.json();
+                console.log("取得したデータ:", data); // デバッグ用
+                return data.results.bindings;
+            } catch (error) {
+                console.error("エラー詳細:", error);
+                throw error;
+            }
+        }
+
+
+        function buildTree(sparqlResults) {
+            const entities = {};  // すべてのエンティティを格納するオブジェクト
+            const childrenSet = new Set();  // 子ノードとして使われたエンティティを追跡するためのセット
+
+            sparqlResults.forEach((result) => {
+                const parent = result.parentLabel.value;
+                const child = result.childLabel.value;
+                const alias = result.childAlias ? result.childAlias.value : null;  // エイリアスが存在する場合のみ取得
+                const alias2 = result.parentAlias ? result.parentAlias.value : null;  // エイリアスが存在する場合のみ取得
+
+
+
+                // 親と子が同じ場合はスキップ
+                if (parent === child) {
+                    console.warn(`親と子が同じです。スキップします: 親: ${parent}, 子: ${child}`);
+                    return;
+                }
+
+                // 親エンティティが未定義なら初期化
+                if (!entities[parent]) {
+                    entities[parent] = { name: parent, aliases: [], children: [] };
+                }
+
+                // 子エンティティが未定義なら初期化
+                if (!entities[child]) {
+                    entities[child] = { name: child, aliases: [], children: [] };
+                }
+
+                // 親エンティティに子エンティティを追加（重複を避ける）
+                if (!entities[parent].children.some(c => c.name === child)) {
+                    entities[parent].children.push(entities[child]);
+                }
+
+                // エイリアスが存在し、まだ追加されていない場合は追加
+                if (alias && !entities[child].aliases.includes(alias)) {
+                    entities[child].aliases.push(alias);
+                }
+                // エイリアスが存在し、まだ追加されていない場合は追加
+                if (alias2 && !entities[parent].aliases.includes(alias2)) {
+                    entities[parent].aliases.push(alias2);
+                }
+
+                // 子エンティティとしてセットに追加
+                childrenSet.add(child);
+            });
+
+            // ルート候補を選定（子として一度も現れないエンティティがルート候補）
+            const rootCandidates = Object.keys(entities).filter(key => !childrenSet.has(key));
+            const roots = rootCandidates.map(root => entities[root]);
+
+            // ルートが1つのみの場合はそのルートを返し、複数の場合は上位のルートノードを作成
+            return roots.length > 1
+                ? { name: document.getElementById("word").value, aliases: [], children: roots }
+                : roots[0];
+        }
+
+        function countExistingTerms(chatgpt, wikidata) {
+            let existingCount = 0; // 存在する単語数
+            let totalCount = 0;    // 総単語数
+            const existingTerms = []; // 存在する単語を格納する配列
+
+            function traverse(node) {
+                for (const key in node) {
+                    if (node.hasOwnProperty(key)) {
+                        totalCount++; // 総単語数をインクリメント
+
+                        // 単語の存在を判定
+                        const searchResult = flexibleSearchInWikidata(key, wikidata);
+                        if (searchResult.found) {
+                            existingCount++; // 存在する単語数をインクリメント
+                            existingTerms.push(key); // 存在する単語をリストに追加
+                        }
+
+                        // 再帰的に子要素を探索
+                        if (typeof node[key] === "object" && node[key] !== null) {
+                            traverse(node[key]);
+                        }
+                    }
+                }
+            }
+
+            traverse(chatgpt);
+
+            return { existingCount, totalCount, existingTerms };
+        }
+
+        function classifyTerms(chatgpt, wikidata) {
+            let parentChildMatches = 0; // 親子関係が正しいもののカウント
+            let termExists = 1;         // 単語が存在するもののカウント
+            let totalTerms = 0;         // 総単語数
+            const existingTerms = [];   // 単語が存在するリスト
+            const notExistingTerms = []; // 存在しない単語リスト
+            const termEvaluations = []; // 単語ごとの評価結果
+            let isFirstResult = true;   // 最初の結果をスキップするためのフラグ
+
+            function traverse(node, parentKey = null) {
+                for (const key in node) {
+                    if (node.hasOwnProperty(key)) {
+                        totalTerms++;
+
+                        // 最初の結果をスキップする処理
+                        if (isFirstResult) {
+                            isFirstResult = false; // 最初の結果をスキップする
+                            traverse(node[key], key); // 子ノードは引き続き処理
+                            continue;
+                        }
+
+                        // 単語が存在するかチェック
+                        const termSearchResult = flexibleSearchInWikidata(key, wikidata);
+                        const parentNode = parentKey ? flexibleSearchInWikidata(parentKey, wikidata) : null;
+
+                        let evaluation = { term: key, parent: parentKey, result: "", details: "" };
+
+                        if (termSearchResult.found) {
+                            termExists++;
+                            existingTerms.push(key);
+
+                            // 親子関係が存在するかチェック
+                            if (
+                                parentNode &&
+                                parentNode.found &&
+                                parentNode.node.children.some(
+                                    (child) => child.name === key || child.aliases.includes(key)
+                                )
+                            ) {
+                                parentChildMatches++;
+                                evaluation.result = "〇";
+                                evaluation.details = `階層: ${termSearchResult.levels}`;
+                            } else {
+                                evaluation.result = "△";
+                                evaluation.details = `別名一致: ${termSearchResult.isAlias ? termSearchResult.matchedAlias : "なし"}`;
+                            }
+                        } else {
+                            notExistingTerms.push(key);
+                            evaluation.result = "✖";
+                        }
+
+                        termEvaluations.push(evaluation);
+
+                        // 再帰的に子要素を探索
+                        if (typeof node[key] === "object" && node[key] !== null) {
+                            traverse(node[key], key);
+                        }
+                    }
+                }
+            }
+
+            traverse(chatgpt);
+
+            return {
+                parentChildMatches,
+                termExists,
+                totalTerms,
+                existingTerms,
+                notExistingTerms,
+                termEvaluations
+            };
+        }
+
+
+
+        function createLogForClassification(classificationResult) {
+            const { parentChildMatches, termExists, totalTerms, termEvaluations } = classificationResult;
+
+            const timestamp = new Date().toISOString();
+            const matchRateExists = `${parentChildMatches} / ${termExists-1} (${(
+                (parentChildMatches / (termExists-1)) *
+                100
+            ).toFixed(2)}%)`; // 親子関係があるもの / 単語が存在するもの
+            const matchRateTotal = `${parentChildMatches} / ${totalTerms-1} (${(
+                (parentChildMatches / (totalTerms-1)) *
+                100
+            ).toFixed(2)}%)`; // 親子関係があるもの / 総単語数
+
+            // 単語情報を1つの文字列にまとめ、その全体をダブルクォーテーションで囲む
+            const termsInfo = termEvaluations
+                .map(
+                    (evaluation) =>
+                        `${evaluation.result}`
+                )
+                .join("\n");
+            const termsInfo2 = termEvaluations
+                .map(
+                    (evaluation) =>
+                        `${evaluation.parent || "なし"}\t${evaluation.term}`
+                )
+                .join("\n");
+
+            const quotedTermsInfo = `"${termsInfo}""${termsInfo2}"`; // 全体をダブルクォーテーションで囲む
+
+            // ログ1行を作成  取得日時　評価結果　親子関係の正確率（存在する単語）　親子関係の正確率（すべての単語）　総単語数
+            return `${timestamp}\t${quotedTermsInfo}\t${matchRateExists}\t${matchRateTotal}\t${totalTerms}`;
+        }
+
+        //結果表示
+        function displayClassificationResults(classificationResult) {
+            const { parentChildMatches, termExists, totalTerms, existingTerms, notExistingTerms, termEvaluations } =
+                classificationResult;
+
+            if (!termEvaluations || !Array.isArray(termEvaluations)) {
+                console.error("termEvaluationsが未定義、または配列ではありません。");
+                return;
+            }
+
+            const matchRateExists = `${parentChildMatches} / ${termExists-1} (${(
+                (parentChildMatches / (termExists-1)) *
+                100
+            ).toFixed(2)}%)`; // 親子関係があるもの / 単語が存在するもの
+            const matchRateTotal = `${parentChildMatches} / ${totalTerms-1} (${(
+                (parentChildMatches / (totalTerms-1)) *
+                100
+            ).toFixed(2)}%)`; // 親子関係があるもの / 総単語数
+
+            const resultsDiv = document.getElementById("results");
+            if (!resultsDiv) {
+                console.error("結果を表示するための要素が見つかりません。");
+                return;
+            }
+
+            // 単語ごとの評価を表形式で表示
+            const evaluationTable = `
+        <table border="1" cellpadding="5" cellspacing="0">
+            <thead>
+                <tr>
+                    <th>親</th>
+                    <th>子</th>
+                    <th>結果</th>
+                    〇：正しい親子関係<br>△：単語のみ存在(親子関係なし)<br>✖：存在しない単語
+                </tr>
+            </thead>
+            <tbody>
+                ${termEvaluations
+                    .map(
+                        (eval) => `
+                    <tr>
+                        <td>${eval.parent || "なし"}</td>
+                        <td>${eval.term}</td>
+                        <td>${eval.result}</td>
+                    </tr>
+                `
+                    )
+                    .join("")}
+            </tbody>
+        </table>
+    `;
+
+            resultsDiv.innerHTML = `
+        <h2>分類結果:</h2>
+        <p>親子関係があるもの / 単語が存在するもの: ${matchRateExists}</p>
+        <p>親子関係があるもの / すべての単語: ${matchRateTotal}</p>
+        <p>総単語数: ${totalTerms}</p>
+        <h3>単語ごとの評価:</h3>
+        ${evaluationTable}
+        <h3>存在する単語:</h3>
+        <ul>
+            ${existingTerms.map((term) => `<li>${term}</li>`).join("")}
+        </ul>
+        <h3>存在しない単語:</h3>
+        <ul>
+            ${notExistingTerms.map((term) => `<li>${term}</li>`).join("")}
+        </ul>
+    `;
+        }
+
+        function main(chatgpt, wikidata) {
+            // 親子関係の検証と分類
+            const classificationResult = classifyTerms(chatgpt, wikidata);
+
+            // 表示処理
+            displayClassificationResults(classificationResult);
+
+            // ログを作成
+            const log = createLogForClassification(classificationResult);
+
+            // ログをテキストエリアに保存
+            saveLogToTextarea(log, "logTextarea");
+        }
+
+
+        //段数が3段の場合のsparqlクエリ
+        function createSPARQLQuery(qid) {
+            return `
+                SELECT DISTINCT ?child ?childLabel ?parent ?parentLabel ?depth ?parentAlias ?childAlias ?concept
+
+WHERE {
+  VALUES ?concept { wd:${qid} }
+    {
+        SELECT ?child ?childLabel ?parent ?parentLabel  ?parentAlias ?childAlias ?concept (1 AS ?depth) WHERE {
+            ?parent wdt:P279 ?concept.
+            ?child wdt:P279 ?parent.
+            ?parent rdfs:label ?parentLabel.
+            ?child rdfs:label ?childLabel.
+            OPTIONAL { ?parent skos:altLabel ?parentAlias. FILTER(LANG(?parentAlias) = "ja") }
+            OPTIONAL { ?child skos:altLabel ?childAlias. FILTER(LANG(?childAlias) = "ja") }
+            FILTER(LANG(?childLabel) = "ja")
+            FILTER(LANG(?parentLabel) = "ja")
+        }
+    }
+    UNION
+    {
+        SELECT ?child ?childLabel ?parent ?parentLabel  ?parentAlias ?childAlias ?concept (2 AS ?depth) WHERE {
+            ?parent wdt:P279/wdt:P279 ?concept.
+            ?child wdt:P279 ?parent.
+            ?parent rdfs:label ?parentLabel.
+            ?child rdfs:label ?childLabel.
+            OPTIONAL { ?parent skos:altLabel ?parentAlias. FILTER(LANG(?parentAlias) = "ja") }
+            OPTIONAL { ?child skos:altLabel ?childAlias. FILTER(LANG(?childAlias) = "ja") }
+            FILTER(LANG(?childLabel) = "ja")
+            FILTER(LANG(?parentLabel) = "ja")
+        }
+    }
+    UNION
+    {
+        SELECT ?child ?childLabel ?parent ?parentLabel  ?parentAlias ?childAlias ?concept (3 AS ?depth) WHERE {
+            ?parent wdt:P279/wdt:P279/wdt:P279 ?concept.
+            ?child wdt:P279 ?parent.
+            ?parent rdfs:label ?parentLabel.
+            ?child rdfs:label ?childLabel.
+            OPTIONAL { ?parent skos:altLabel ?parentAlias. FILTER(LANG(?parentAlias) = "ja") }
+            OPTIONAL { ?child skos:altLabel ?childAlias. FILTER(LANG(?childAlias) = "ja") }
+            FILTER(LANG(?childLabel) = "ja")
+            FILTER(LANG(?parentLabel) = "ja")
+        }
+    }
+}
+ORDER BY ?parentLabel
+
+            `;
+        }
+
+        //段数が4段の場合のsparqlクエリ
+        function createSPARQLQuery2(qid) {
+            return `
+                SELECT DISTINCT ?child ?childLabel ?parent ?parentLabel ?depth ?parentAlias ?childAlias ?concept
+
+WHERE {
+  VALUES ?concept { wd:${qid} }
+    {
+        SELECT ?child ?childLabel ?parent ?parentLabel  ?parentAlias ?childAlias ?concept (1 AS ?depth) WHERE {
+            ?parent wdt:P279 ?concept.
+            ?child wdt:P279 ?parent.
+            ?parent rdfs:label ?parentLabel.
+            ?child rdfs:label ?childLabel.
+            OPTIONAL { ?parent skos:altLabel ?parentAlias. FILTER(LANG(?parentAlias) = "ja") }
+            OPTIONAL { ?child skos:altLabel ?childAlias. FILTER(LANG(?childAlias) = "ja") }
+            FILTER(LANG(?childLabel) = "ja")
+            FILTER(LANG(?parentLabel) = "ja")
+        }
+    }
+    UNION
+    {
+        SELECT ?child ?childLabel ?parent ?parentLabel  ?parentAlias ?childAlias ?concept (2 AS ?depth) WHERE {
+            ?parent wdt:P279/wdt:P279 ?concept.
+            ?child wdt:P279 ?parent.
+            ?parent rdfs:label ?parentLabel.
+            ?child rdfs:label ?childLabel.
+            OPTIONAL { ?parent skos:altLabel ?parentAlias. FILTER(LANG(?parentAlias) = "ja") }
+            OPTIONAL { ?child skos:altLabel ?childAlias. FILTER(LANG(?childAlias) = "ja") }
+            FILTER(LANG(?childLabel) = "ja")
+            FILTER(LANG(?parentLabel) = "ja")
+        }
+    }
+    UNION
+    {
+        SELECT ?child ?childLabel ?parent ?parentLabel  ?parentAlias ?childAlias ?concept (3 AS ?depth) WHERE {
+            ?parent wdt:P279/wdt:P279/wdt:P279 ?concept.
+            ?child wdt:P279 ?parent.
+            ?parent rdfs:label ?parentLabel.
+            ?child rdfs:label ?childLabel.
+            OPTIONAL { ?parent skos:altLabel ?parentAlias. FILTER(LANG(?parentAlias) = "ja") }
+            OPTIONAL { ?child skos:altLabel ?childAlias. FILTER(LANG(?childAlias) = "ja") }
+            FILTER(LANG(?childLabel) = "ja")
+            FILTER(LANG(?parentLabel) = "ja")
+        }
+    }
+        UNION
+    {
+        SELECT ?child ?childLabel ?parent ?parentLabel  ?parentAlias ?childAlias ?concept (4 AS ?depth) WHERE {
+            ?parent wdt:P279/wdt:P279/wdt:P279/wdt:P279 ?concept.
+            ?child wdt:P279 ?parent.
+            ?parent rdfs:label ?parentLabel.
+            ?child rdfs:label ?childLabel.
+            OPTIONAL { ?parent skos:altLabel ?parentAlias. FILTER(LANG(?parentAlias) = "ja") }
+            OPTIONAL { ?child skos:altLabel ?childAlias. FILTER(LANG(?childAlias) = "ja") }
+            FILTER(LANG(?childLabel) = "ja")
+            FILTER(LANG(?parentLabel) = "ja")
+        }
+    }
+}
+ORDER BY ?parentLabel
+
+            `;
+        }
+
+        //段数が3段の場合のsparqlクエリ
+        function createSPARQLQuery3(qid) {
+            return `
+                SELECT DISTINCT ?child ?childLabel ?parent ?parentLabel ?depth ?parentAlias ?childAlias ?concept
+
+WHERE {
+  VALUES ?concept { wd:${qid} }
+    {
+        SELECT ?child ?childLabel ?parent ?parentLabel  ?parentAlias ?childAlias ?concept (1 AS ?depth) WHERE {
+            ?parent wdt:P279 ?concept.
+            ?child wdt:P279 ?parent.
+            ?parent rdfs:label ?parentLabel.
+            ?child rdfs:label ?childLabel.
+            OPTIONAL { ?parent skos:altLabel ?parentAlias. FILTER(LANG(?parentAlias) = "ja") }
+            OPTIONAL { ?child skos:altLabel ?childAlias. FILTER(LANG(?childAlias) = "ja") }
+            FILTER(LANG(?childLabel) = "ja")
+            FILTER(LANG(?parentLabel) = "ja")
+        }
+    }
+    UNION
+    {
+        SELECT ?child ?childLabel ?parent ?parentLabel  ?parentAlias ?childAlias ?concept (2 AS ?depth) WHERE {
+            ?parent wdt:P279/wdt:P279 ?concept.
+            ?child wdt:P279 ?parent.
+            ?parent rdfs:label ?parentLabel.
+            ?child rdfs:label ?childLabel.
+            OPTIONAL { ?parent skos:altLabel ?parentAlias. FILTER(LANG(?parentAlias) = "ja") }
+            OPTIONAL { ?child skos:altLabel ?childAlias. FILTER(LANG(?childAlias) = "ja") }
+            FILTER(LANG(?childLabel) = "ja")
+            FILTER(LANG(?parentLabel) = "ja")
+        }
+    }
+}
+ORDER BY ?parentLabel
+
+            `;
+        }
+
+        async function fetchAndBuildTree(qid) {
+            let stages = document.getElementById('stages').value;
+            let query;
+            if (stages == "three") {
+                query = createSPARQLQuery(qid);
+            } else if (stages == "four") {
+                query = createSPARQLQuery2(qid);
+            } else {
+                query = createSPARQLQuery3(qid);
+            }
+            try {
+                const sparqlResults = await fetchSPARQLResults(query);
+                const tree = buildTree(sparqlResults);
+                return tree;
+            } catch (error) {
+                console.error("エラーが発生しました:", error);
+            }
+        }
+
+        // JSONデータをダウンロードする関数
+        function downloadJSON(jsonData, filename) {
+            const jsonString = JSON.stringify(jsonData, null, 2); // JSONデータを文字列化
+            const blob = new Blob([jsonString], { type: 'application/json' }); // Blobオブジェクトを作成
+            const link = document.createElement('a'); // aタグ（リンク）を作成
+            link.href = URL.createObjectURL(blob); // Blobデータをリンクに割り当て
+            link.download = filename; // ダウンロードするファイル名を指定
+            document.body.appendChild(link); // 一時的にリンクをDOMに追加
+            link.click(); // リンクをクリックしてダウンロードをトリガー
+            document.body.removeChild(link); // リンクをDOMから削除
+        }
+        function countTrees(depth, width) {
+            if (depth === 1) return 1; // 基底条件
+            let count = 1;
+            for (let i = 0; i < width; i++) {
+                count *= countTrees(depth - 1, width);
+            }
+            return count;
+        }
+
+        // ログを保持する配列（グローバル変数）
+        let logEntries = [];
+
+        function createLog(comparisonResult, termCountResult) {
+            const timestamp = new Date().toISOString(); // 取得日時
+
+            // 一致率を計算
+            const matchRate = `${comparisonResult.matchCount} / ${comparisonResult.totalCount}`;
+
+            // 単語の存在数情報
+            const termRate = `${termCountResult.existingCount} / ${termCountResult.totalCount}`;
+            const termList = termCountResult.existingTerms.join(", ");
+
+            // TSV形式でログを作成
+            const log = [
+                timestamp,
+                //親子関係の正誤判定
+                comparisonResult.resultsHTML.replace(/<[^>]*>?/gm, ""), // HTMLタグを除去
+                //一致率
+                `${matchRate}`,
+                //単語の存在数
+                `${termRate}`,
+                //存在する単語
+                `${termList}`
+            ].join("\t");
+
+            return log;
+        }
+
+        // ログデータを保存し、テキストエリアに表示する関数
+        function saveLog(log, textareaId, filename = "log.tsv") {
+            // HTMLのテキストエリアにログを追加
+            const textarea = document.getElementById(textareaId);
+            if (textarea) {
+                textarea.value += log + "\n";
+            } else {
+                console.error(`テキストエリア (${textareaId}) が見つかりません。`);
+            }
+
+            // ログをTSVファイルとして保存（追記用のダウンロードリンクを生成）
+            const blob = new Blob([log + "\n"], { type: "text/tab-separated-values" });
+            const link = document.createElement("a");
+            link.href = URL.createObjectURL(blob);
+            link.download = filename;
+            link.style.display = "none";
+
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+
+        function formatResultsAsTable(comparisonResult) {
+            const rows = [];
+            const lines = comparisonResult.resultsHTML.replace(/<[^>]*>?/gm, "").split("\n");
+
+            lines.forEach((line) => {
+                const match = line.match(/「([^:]+): ([^」]+)」 (.+) \((.+)\)/);
+                if (match) {
+                    const parent = match[1]; // 親単語
+                    const child = match[2];  // 子単語
+                    const judgment = match[3]; // 判定（正しい親子関係、不一致など）
+                    const details = match[4];  // 詳細情報（階層など）
+                    rows.push({ parent, child, judgment, details });
+                }
+            });
+
+            return rows;
+        }
+
+
+        function saveLogToTextarea(log, textareaId) {
+            // HTMLのテキストエリアにログを追加
+            const textarea = document.getElementById(textareaId);
+            if (!textarea) {
+                console.error(`テキストエリア (${textareaId}) が見つかりません。`);
+                return;
+            }
+
+            // テキストエリアにログを追加
+            textarea.value += log + "\n";
+        }
+
+        function downloadLogFromTextarea(textareaId, filename = "log.tsv") {
+            const textarea = document.getElementById(textareaId);
+            if (!textarea) {
+                console.error(`テキストエリア (${textareaId}) が見つかりません。`);
+                return;
+            }
+
+            const content = textarea.value;
+            if (!content) {
+                console.warn("テキストエリアが空です。ダウンロードは実行されません。");
+                return;
+            }
+
+            // テキストエリアの内容をファイルとしてダウンロード
+            const blob = new Blob([content], { type: "text/tab-separated-values" });
+            const link = document.createElement("a");
+            link.href = URL.createObjectURL(blob);
+            link.download = filename;
+            link.style.display = "none";
+
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+
+        function calculateWordCount(depth, width) {
+            let totalNodes = 0;
+            for (let i = 1; i <= depth; i++) {
+                totalNodes += Math.pow(width, i);
+            }
+            return totalNodes;
+        }
+
+    </script>
+    <script>
+
+        // // ページにボタンを追加してダウンロードできるようにする
+        // const format1Button = document.createElement('button1');
+        // format1Button.textContent = 'SPARQLクエリをダウンロード';
+        // format1Button.onclick = downloadJSON(tree, 'sparql_result.json'); // SPARQLクエリをダウンロード
+        // document.body.appendChild(format1Button);
+
+        // const format2Button = document.createElement('button2');
+        // format2Button.textContent = 'ChatGPTをダウンロード';
+        // format2Button.onclick = downloadJSON(results_json, 'make_result.json'); // 作成したデータをダウンロード
+        // document.body.appendChild(format2Button);
+
+        document.addEventListener("DOMContentLoaded", () => {
+            // ログを保持する配列（グローバル変数）
+            let logEntries = [];
+            let results_json;
+            let tree;
+            window.addEventListener('load', () => {
+                const resultJson = JSON.parse('{"家具":{"椅子":{"ダイニングチェア":{},"オフィスチェア":{}},"テーブル":{"ダイニングテーブル":{},"コーヒーテーブル":{}}}}')
+                const resultDiv = document.getElementById("result"); // 結果を表示するためのdiv要素を取得
+                resultDiv.innerHTML = `<h2>結果:</h2>`;
+                createTree(resultDiv, resultJson);
+            })
+
+            document.getElementById("btn").addEventListener("click", () => {
+
+                async function mainProcess() {
+                    const word = document.getElementById("word").value;
+                    const depth = parseInt(document.getElementById("depth").value);
+                    const width = parseInt(document.getElementById("width").value);
+                    const all = countTrees(depth, width);
+                    const count = calculateWordCount(depth, width);
+                    console.log(count);
+                    const initialPrompt = `単語「${word}」の${depth}段${width}幅の"is-a"関係のみをツリー構造で生成してください。
+                    各段には複数の${word}に関連する日本語の単語を含めてください。単語の前に段数の数の空白を追加してください。
+                    親と子に同じ単語は含めないでください。表示は空白と単語のみ。
+                    総単語数は入力された単語を除いた、${count}個生成してください。`;
+                    let conversation = [{ role: "user", content: initialPrompt }];
+
+                    let result = await fetchResults(conversation); // 非同期処理の完了を待つ
+                    console.log(result);
+
+                    results_json = displayResults(result);
+                    console.log(results_json);
+
+                    const userInputQID = document.getElementById("QID").value;
+                    tree = await fetchAndBuildTree(userInputQID); // 非同期処理の完了を待つ
+                    console.log(tree);
+
+                    document.getElementById("test2").value = safeStringify(tree);
+                    main(results_json, tree);
+                    //displayComparisonResult(results_json, tree);
+                }
+
+                mainProcess();
+
+
+
+                // // ログデータを保存し、テキストエリアに表示する関数
+                // function saveLogs(chatgptData, wikidataJson, comparisonResult) {
+                //     const timestamp = new Date().toISOString(); // タイムスタンプで識別
+
+                //     // 新しいログエントリを追加
+                //     logEntries.push({
+                //         timestamp: timestamp,
+                //         chatgptData: JSON.stringify(chatgptData),
+                //         wikidataJson: JSON.stringify(wikidataJson),
+                //         comparisonResult: comparisonResult.replace(/\n/g, " ") // 改行をスペースに置換
+                //     });
+
+                //     // CSV形式に変換
+                //     let csvContent = "タイムスタンプ,生成データ,Wikidataデータ,検証結果\n";
+                //     logEntries.forEach(entry => {
+                //         csvContent += `"${entry.timestamp}","${entry.chatgptData}","${entry.wikidataJson}","${entry.comparisonResult}"\n`;
+                //     });
+
+                //     // テキストエリアに表示
+                //     const logDisplay = document.getElementById("logDisplay");
+                //     if (logDisplay) {
+                //         logDisplay.value = csvContent;
+                //     } else {
+                //         console.error("ログ表示用のテキストエリアが見つかりません (id='logDisplay')。");
+                //     }
+
+                //     // BlobでCSVデータを生成
+                //     const bom = "\uFEFF"; // BOM (Byte Order Mark) を追加
+                //     const blob = new Blob([bom + csvContent], { type: "text/csv;charset=utf-8" });
+
+                //     // ダウンロード用リンクを作成
+                //     const link = document.createElement("a");
+                //     link.href = URL.createObjectURL(blob);
+                //     link.download = "logs.csv"; // ファイル名
+                //     document.body.appendChild(link);
+                //     link.click();
+                //     document.body.removeChild(link);
+                // }
+
+            });
+        });
+    </script>
+</body>
+
+</html>
